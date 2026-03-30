@@ -38,8 +38,8 @@ def run_rollout(
     simulator: SwarmSimulator,
     agent_pool: AgentPool,
     max_tasks: int,
-    exploration_noise_start: float = 0.10,
-    exploration_noise_decay: float = 0.999,
+    exploration_noise_start: float = 0.06,
+    exploration_noise_decay: float = 0.9995,
     learning_enabled: bool = True,
 ) -> Dict[str, object]:
     lyapunov_trace: List[float] = []
@@ -64,15 +64,29 @@ def run_rollout(
         rewards_trace.append(float(np.mean(list(rewards.values()))))
 
         if learning_enabled:
+            truthful = result.get("truthful_bids", {})
+            winner_id = result.get("winner_id", None)
             for drone_id, state in obs.items():
                 next_state = state
+                reward = rewards.get(drone_id, 0.0)
+
+                # Team-aware shaping: all agents observe completion signal,
+                # winner keeps dense utility while non-winners get small coordination reward.
+                if winner_id is not None:
+                    if drone_id == winner_id:
+                        reward += 0.10 * float(task.priority / 100.0)
+                    else:
+                        reward += 0.02 * float(task.priority / 100.0)
+
                 agent_pool.update_agent(
                     drone_id,
                     state,
                     bids.get(drone_id, 0.0),
-                    rewards.get(drone_id, 0.0),
+                    reward,
                     next_state,
                     False,
+                    truthful_bid=float(truthful.get(drone_id, 0.0)),
+                    winner_id=winner_id,
                 )
 
     return {
@@ -114,14 +128,22 @@ def run_method_comparison(
                     seed=seed,
                 )
 
-                daca_cfg = DACAConfig(use_energy_awareness=True, device=device)
+                daca_cfg = DACAConfig(
+                    use_energy_awareness=True,
+                    device=device,
+                    learning_rate=0.015,
+                    critic_lr=0.04,
+                    behavior_lr=0.10,
+                    anchor_mix=0.60,
+                    model_mix=0.95,
+                )
                 pool = AgentPool(n, agent_type=method, daca_config=daca_cfg)
                 rollout = run_rollout(
                     simulator,
                     pool,
                     max_tasks=int(duration * task_arrival_rate * 1.2),
-                    exploration_noise_start=0.10 if method in ("daca", "qlearning") else 0.0,
-                    exploration_noise_decay=0.999,
+                    exploration_noise_start=0.02 if method == "daca" else (0.10 if method == "qlearning" else 0.0),
+                    exploration_noise_decay=0.9996 if method == "daca" else 0.999,
                     learning_enabled=method in ("daca", "qlearning"),
                 )
 
@@ -178,13 +200,13 @@ def run_convergence_experiment(
                     duration=max(120.0, n_tasks / 10.0 + 1.0),
                     seed=seed,
                 )
-                daca_cfg = DACAConfig(device=device)
+                daca_cfg = DACAConfig(device=device, learning_rate=0.015, critic_lr=0.04, behavior_lr=0.10, anchor_mix=0.60, model_mix=0.95)
                 pool = AgentPool(100, agent_type=method, daca_config=daca_cfg)
                 rollout = run_rollout(
                     simulator,
                     pool,
                     max_tasks=n_tasks,
-                    exploration_noise_start=0.10 if method in ("daca", "qlearning") else 0.0,
+                    exploration_noise_start=0.02 if method == "daca" else (0.10 if method == "qlearning" else 0.0),
                     exploration_noise_decay=0.9995,
                     learning_enabled=method in ("daca", "qlearning"),
                 )
@@ -269,7 +291,7 @@ def run_ablation_study(
                 simulator,
                 pool,
                 max_tasks=800,
-                exploration_noise_start=0.10 if conf["agent_type"] in ("daca", "qlearning") else 0.0,
+                exploration_noise_start=0.02 if conf["agent_type"] == "daca" else (0.10 if conf["agent_type"] == "qlearning" else 0.0),
                 exploration_noise_decay=0.999,
                 learning_enabled=conf["agent_type"] in ("daca", "qlearning"),
             )

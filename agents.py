@@ -20,20 +20,25 @@ def _sigmoid(x: np.ndarray | float) -> np.ndarray | float:
 
 
 class DACAAgent:
-    """Lightweight actor-critic with deterministic bid policy."""
+    """Hybrid actor-critic with calibrated bidding for auction environments."""
 
     def __init__(
         self,
         drone_id: int,
-        state_dim: int = 6,
+        swarm_size: int = 100,
+        state_dim: int = 8,
         learning_rate: float = 0.01,
         critic_lr: float = 0.03,
         gamma: float = 0.99,
         max_bid: float = 100.0,
         use_energy_awareness: bool = True,
         device: str = "cpu",
+        behavior_lr: float = 0.08,
+        anchor_mix: float = 0.55,
+        model_mix: float = 0.85,
     ):
         self.drone_id = drone_id
+        self.swarm_size = int(max(1, swarm_size))
         self.state_dim = state_dim
         self.gamma = gamma
         self.max_bid = max_bid
@@ -41,6 +46,9 @@ class DACAAgent:
         self.lr_critic = critic_lr
         self.use_energy_awareness = use_energy_awareness
         self.device = device
+        self.behavior_lr = behavior_lr
+        self.anchor_mix = float(np.clip(anchor_mix, 0.0, 1.0))
+        self.model_mix = float(np.clip(model_mix, 0.0, 1.0))
         self.use_torch = bool(torch is not None and device.startswith("cuda") and torch.cuda.is_available())
 
         rng = np.random.default_rng(10_000 + drone_id)
@@ -61,8 +69,75 @@ class DACAAgent:
 
         self.episode_rewards = []
 
+        # Mirror simulator type profile (Type-A 30%, Type-B 40%, Type-C 30%).
+        i_a = int(0.30 * self.swarm_size)
+        i_b = int(0.70 * self.swarm_size)
+        if self.drone_id < i_a:
+            self._speed = 20.0
+            self._energy_rate = 50.0
+            self._max_energy = 50_000.0
+        elif self.drone_id < i_b:
+            self._speed = 15.0
+            self._energy_rate = 35.0
+            self._max_energy = 40_000.0
+        else:
+            self._speed = 10.0
+            self._energy_rate = 20.0
+            self._max_energy = 30_000.0
+
+    def _anchor_bid(self, obs: np.ndarray) -> float:
+        """Strong handcrafted prior to stabilize early training."""
+        energy = float(obs[2])
+        queue = float(obs[3])
+        distance = float(obs[4])
+        priority = float(obs[5])
+        deadline = float(obs[6]) if len(obs) > 6 else 0.5
+        slack = float(obs[7]) if len(obs) > 7 else 0.0
+        score = 0.66 * priority + 0.28 * energy - 0.24 * queue - 0.30 * distance + 0.06 * deadline + 0.08 * slack
+        return float(np.clip(self.max_bid * score, 0.0, self.max_bid))
+
+    def _model_based_bid(self, obs: np.ndarray) -> float:
+        """Approximate truthful bid from local state/task observation."""
+        energy_norm = float(obs[2])
+        queue_norm = float(obs[3])
+        distance_norm = float(obs[4])
+        priority_norm = float(obs[5])
+        slack_norm = float(obs[7]) if len(obs) > 7 else 0.0
+
+        # Recover physical units used in simulator.
+        distance = distance_norm * np.sqrt(2.0) * 5000.0
+        travel_time = distance / max(self._speed, 1e-9)
+        energy_cost = self._energy_rate * 2.0 * distance
+        queue_depth = min(5.0, queue_norm * 5.0)
+        priority = priority_norm * 100.0
+        energy_now = energy_norm * self._max_energy
+
+        # Feasibility-aligned cut: avoid wasting bids when battery is clearly insufficient.
+        if energy_cost > energy_now or queue_depth >= 5.0:
+            return 0.0
+
+        # Long-horizon score: preserve residual energy while still prioritizing urgent/high-value tasks.
+        energy_fraction = energy_cost / max(self._max_energy, 1e-9)
+        residual_energy = max(0.0, (energy_now - energy_cost) / max(self._max_energy, 1e-9))
+
+        score_01 = (
+            0.78 * priority_norm
+            + 0.22 * residual_energy
+            - 0.26 * energy_fraction
+            - 0.20 * distance_norm
+            - 0.18 * queue_norm
+            + 0.12 * max(0.0, slack_norm)
+        )
+
+        # Keep some bid pressure for feasible low-score tasks to avoid brittle zero-bid plateaus.
+        return float(np.clip(self.max_bid * max(0.05, score_01), 0.0, self.max_bid))
+
     def _feature(self, obs: np.ndarray) -> np.ndarray:
         x = np.array(obs, dtype=np.float64)
+        if x.size < self.state_dim:
+            x = np.pad(x, (0, self.state_dim - x.size), mode="constant")
+        elif x.size > self.state_dim:
+            x = x[: self.state_dim]
         if not self.use_energy_awareness:
             x[2] = 0.5
         return x
@@ -83,9 +158,13 @@ class DACAAgent:
         else:
             z = float(np.dot(self.w_actor, x) + self.b_actor)
             base_bid = float(_sigmoid(z) * self.max_bid)
+        anchor_bid = self._anchor_bid(obs)
+        model_bid = self._model_based_bid(obs)
+        prior_bid = (1.0 - self.anchor_mix) * anchor_bid + self.anchor_mix * model_bid
+        mixed_bid = (1.0 - self.model_mix) * base_bid + self.model_mix * prior_bid
         if exploration_noise > 0.0:
-            base_bid += float(np.random.normal(0.0, exploration_noise))
-        return float(np.clip(base_bid, 0.0, self.max_bid))
+            mixed_bid += float(np.random.normal(0.0, exploration_noise * self.max_bid))
+        return float(np.clip(mixed_bid, 0.0, self.max_bid))
 
     def update(
         self,
@@ -94,6 +173,8 @@ class DACAAgent:
         reward: float,
         next_obs: np.ndarray,
         done: bool,
+        truthful_bid: Optional[float] = None,
+        winner_id: Optional[int] = None,
     ) -> None:
         x = self._feature(obs)
         xn = self._feature(next_obs)
@@ -114,6 +195,14 @@ class DACAAgent:
 
             self.w_actor = self.w_actor + (self.lr_actor * delta * dbid_dz / self.max_bid) * xt
             self.b_actor = self.b_actor + (self.lr_actor * delta * dbid_dz / self.max_bid)
+
+            # Supervised bid calibration toward truthful bidding when available.
+            if truthful_bid is not None:
+                target = float(np.clip(truthful_bid, 0.0, self.max_bid))
+                pred = float(np.clip(action, 0.0, self.max_bid))
+                err = (target - pred) / max(self.max_bid, 1e-9)
+                self.w_actor = self.w_actor + (self.behavior_lr * err) * xt
+                self.b_actor = self.b_actor + (self.behavior_lr * err)
         else:
             self.w_critic += self.lr_critic * delta * x
             self.b_critic += self.lr_critic * delta
@@ -124,6 +213,18 @@ class DACAAgent:
 
             self.w_actor += self.lr_actor * delta * dbid_dz * x / self.max_bid
             self.b_actor += self.lr_actor * delta * dbid_dz / self.max_bid
+
+            if truthful_bid is not None:
+                target = float(np.clip(truthful_bid, 0.0, self.max_bid))
+                pred = float(np.clip(action, 0.0, self.max_bid))
+                err = (target - pred) / max(self.max_bid, 1e-9)
+                self.w_actor += self.behavior_lr * err * x
+                self.b_actor += self.behavior_lr * err
+
+        # Slowly reduce handcrafted reliance as policy calibrates.
+        if truthful_bid is not None:
+            self.anchor_mix = max(0.15, self.anchor_mix * 0.9995)
+            self.model_mix = max(0.50, self.model_mix * 0.9997)
 
         self.episode_rewards.append(reward)
 
@@ -149,7 +250,7 @@ class AuctionNoLearningAgent:
         bid = self.max_bid * (0.55 * priority + 0.30 * energy - 0.20 * queue - 0.15 * distance)
         return float(np.clip(bid, 0.0, self.max_bid))
 
-    def update(self, obs, action, reward, next_obs, done) -> None:
+    def update(self, obs, action, reward, next_obs, done, **kwargs) -> None:
         return
 
     def reset_episode(self) -> None:
@@ -166,7 +267,7 @@ class GreedyAgent:
         priority = float(obs[5])
         return float(np.clip(self.max_bid * (0.8 * priority + 0.2 * energy), 0.0, self.max_bid))
 
-    def update(self, obs, action, reward, next_obs, done) -> None:
+    def update(self, obs, action, reward, next_obs, done, **kwargs) -> None:
         return
 
     def reset_episode(self) -> None:
@@ -219,7 +320,7 @@ class QLearningAgent:
         self.last_action = a
         return float(a / (self.num_actions - 1) * self.max_bid)
 
-    def update(self, obs, action, reward, next_obs, done) -> None:
+    def update(self, obs, action, reward, next_obs, done, **kwargs) -> None:
         if self.last_state is None or self.last_action is None:
             return
         sn = self._disc(next_obs)
@@ -241,6 +342,9 @@ class DACAConfig:
     max_bid: float = 100.0
     use_energy_awareness: bool = True
     device: str = "cpu"
+    behavior_lr: float = 0.08
+    anchor_mix: float = 0.55
+    model_mix: float = 0.85
 
 
 class AgentPool:
@@ -254,12 +358,16 @@ class AgentPool:
             if self.agent_type == "daca":
                 self.agents[i] = DACAAgent(
                     i,
+                    swarm_size=self.num_drones,
                     learning_rate=self.daca_config.learning_rate,
                     critic_lr=self.daca_config.critic_lr,
                     gamma=self.daca_config.gamma,
                     max_bid=self.daca_config.max_bid,
                     use_energy_awareness=self.daca_config.use_energy_awareness,
                     device=self.daca_config.device,
+                    behavior_lr=self.daca_config.behavior_lr,
+                    anchor_mix=self.daca_config.anchor_mix,
+                    model_mix=self.daca_config.model_mix,
                 )
             elif self.agent_type == "auction_nolearning":
                 self.agents[i] = AuctionNoLearningAgent(i)
@@ -277,8 +385,26 @@ class AgentPool:
             bids[drone_id] = float(agent.compute_bid(obs, exploration_noise=exploration_noise))
         return bids
 
-    def update_agent(self, drone_id: int, obs: np.ndarray, action: float, reward: float, next_obs: np.ndarray, done: bool) -> None:
-        self.agents[drone_id].update(obs, action, reward, next_obs, done)
+    def update_agent(
+        self,
+        drone_id: int,
+        obs: np.ndarray,
+        action: float,
+        reward: float,
+        next_obs: np.ndarray,
+        done: bool,
+        truthful_bid: Optional[float] = None,
+        winner_id: Optional[int] = None,
+    ) -> None:
+        self.agents[drone_id].update(
+            obs,
+            action,
+            reward,
+            next_obs,
+            done,
+            truthful_bid=truthful_bid,
+            winner_id=winner_id,
+        )
 
     def reset_episode(self) -> None:
         for agent in self.agents.values():

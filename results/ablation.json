@@ -2,9 +2,9 @@
   "swarm_size": 100,
   "metric": "task_acceptance_rate",
   "results": {
-    "full_daca": 31.17614415133935,
-    "without_energy_awareness": 31.164324045463864,
-    "without_auction_mechanism": 31.316997066944687,
+    "full_daca": 37.178290778840974,
+    "without_energy_awareness": 37.62356034958138,
+    "without_auction_mechanism": 31.35387654326764,
     "without_policy_gradient": 35.45147556158706,
     "without_valuation_learning": 31.230737020542932
   }

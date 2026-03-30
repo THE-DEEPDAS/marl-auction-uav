@@ -237,11 +237,20 @@ class SwarmSimulator:
         distance = self._distance(drone, task)
         distance_norm = min(distance / (np.sqrt(2.0) * self.area_size), 1.0)
         priority_norm = task.priority / 100.0
+        deadline_norm = min(max(task.deadline / 300.0, 0.0), 1.0)
+
+        est_travel = distance / max(drone.dtype.cruise_speed, 1e-9)
+        est_wait = drone.queue_depth * drone.dtype.processing_time
+        est_finish = est_wait + est_travel + task.processing_time
+        slack = (task.deadline - est_finish) / 300.0
+        slack_norm = min(max(slack, -1.0), 1.0)
         return np.array(
             [
                 *drone.state_vector(self.area_size).tolist(),
                 distance_norm,
                 priority_norm,
+                deadline_norm,
+                slack_norm,
             ],
             dtype=np.float64,
         )

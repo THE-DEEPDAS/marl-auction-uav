@@ -50,6 +50,7 @@ def load_results(results_dir: str = "results") -> Dict[str, Dict]:
     out: Dict[str, Dict] = {}
 
     out["convergence"] = _load_json(root / "convergence.json")
+    out["real_convergence"] = _load_json(root / "real_convergence.json")
     out["scalability"] = _load_json(root / "scalability.json")
     out["ablation"] = _load_json(root / "ablation.json")
     out["all"] = _load_json(root / "all_results.json")
@@ -121,6 +122,54 @@ def plot_convergence(all_results: Dict, output_file: str) -> None:
     ax.grid(alpha=0.3, which="both")
     ax.legend(loc="best")
     plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved %s", output_file)
+
+
+def plot_real_convergence(all_results: Dict, output_file: str) -> None:
+    data = all_results.get("real_convergence", {})
+    methods = data.get("methods", {}) if isinstance(data, dict) else {}
+    if not methods:
+        logger.warning("Real convergence file not found, skipping real convergence plot")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    axes = axes.ravel()
+
+    metrics = [
+        ("lyapunov_mean", "lyapunov_std", r"$\Psi(t)$ (Bid-Truth MSE)"),
+        ("best_response_gain_mean", "best_response_gain_std", "Best-Response Gain"),
+        ("bid_mae_mean", "bid_mae_std", "Bid Truthfulness MAE"),
+        ("efficiency_gap_mean", "efficiency_gap_std", "Allocation Efficiency Gap"),
+    ]
+
+    for ax, (m_key, s_key, ylab) in zip(axes, metrics):
+        for method in ORDERED_METHODS:
+            rec = methods.get(method, {})
+            x = rec.get("window_midpoints", [])
+            y = rec.get(m_key, [])
+            s = rec.get(s_key, [])
+            if not x or not y:
+                continue
+            xx = np.array(x, dtype=np.float64)
+            yy = np.array(y, dtype=np.float64)
+            ss = np.array(s, dtype=np.float64) if s else np.zeros_like(yy)
+
+            ax.plot(xx, yy, linewidth=2.1, color=COLOR_MAP[method], label=METHOD_NAMES[method])
+            ax.fill_between(xx, np.maximum(yy - ss, 0.0), yy + ss, alpha=0.16, color=COLOR_MAP[method])
+
+        ax.set_ylabel(ylab)
+        ax.grid(alpha=0.3)
+
+    axes[2].set_xlabel("Tasks Processed")
+    axes[3].set_xlabel("Tasks Processed")
+    axes[0].set_title("Real Convergence Diagnostics")
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False, bbox_to_anchor=(0.5, 1.02))
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(output_file, dpi=300, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", output_file)
@@ -246,6 +295,7 @@ def generate_all_plots(results_dir: str = "results", output_dir: str = "plots") 
         output_file=os.path.join(output_dir, "fairness.png"),
     )
     plot_convergence(all_results, os.path.join(output_dir, "convergence_rates.png"))
+    plot_real_convergence(all_results, os.path.join(output_dir, "real_convergence_diagnostics.png"))
     plot_scalability(all_results, os.path.join(output_dir, "scalability.png"))
     plot_ablation(all_results, os.path.join(output_dir, "ablation_study.png"))
     save_summary_tables(all_results, output_dir)

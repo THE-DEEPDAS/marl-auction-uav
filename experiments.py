@@ -34,6 +34,65 @@ def _mean_std(values: List[float]) -> Dict[str, object]:
     }
 
 
+def _auction_outcome_from_profile(profile_bids: Dict[int, float], feasible_ids: List[int]) -> Tuple[int | None, float]:
+    if not feasible_ids:
+        return None, 0.0
+
+    ranked = sorted(
+        [(float(max(0.0, profile_bids.get(i, 0.0))), i) for i in feasible_ids],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    winner_bid, winner_id = ranked[0]
+    payment = ranked[1][0] if len(ranked) > 1 else 0.0
+    return winner_id, float(payment)
+
+
+def _best_response_gain(
+    bids: Dict[int, float],
+    truthful: Dict[int, float],
+    feasible_ids: List[int],
+) -> float:
+    winner_id, payment = _auction_outcome_from_profile(bids, feasible_ids)
+    current_util = {i: 0.0 for i in feasible_ids}
+    if winner_id is not None:
+        current_util[winner_id] = float(max(0.0, truthful.get(winner_id, 0.0)) - payment)
+
+    gains: List[float] = []
+    for i in feasible_ids:
+        dev_bids = dict(bids)
+        dev_bids[i] = float(max(0.0, truthful.get(i, 0.0)))
+        dev_winner, dev_payment = _auction_outcome_from_profile(dev_bids, feasible_ids)
+        dev_util = 0.0
+        if dev_winner == i:
+            dev_util = float(max(0.0, truthful.get(i, 0.0)) - dev_payment)
+        gains.append(dev_util - current_util[i])
+    return float(max(0.0, max(gains) if gains else 0.0))
+
+
+def _window_mean(arr: List[float], window_size: int) -> List[float]:
+    if not arr or window_size <= 0:
+        return []
+    out: List[float] = []
+    for i in range(0, len(arr), window_size):
+        chunk = arr[i : i + window_size]
+        out.append(float(np.mean(chunk)))
+    return out
+
+
+def _aggregate_windows(traces: List[List[float]]) -> Dict[str, List[float]]:
+    if not traces:
+        return {"mean": [], "std": []}
+    min_len = min(len(t) for t in traces)
+    if min_len == 0:
+        return {"mean": [], "std": []}
+    arr = np.array([t[:min_len] for t in traces], dtype=np.float64)
+    return {
+        "mean": [float(x) for x in np.mean(arr, axis=0)],
+        "std": [float(x) for x in np.std(arr, axis=0)],
+    }
+
+
 def run_rollout(
     simulator: SwarmSimulator,
     agent_pool: AgentPool,
@@ -227,6 +286,140 @@ def run_convergence_experiment(
     return results
 
 
+def run_real_convergence_experiment(
+    seeds: Iterable[int],
+    total_tasks: int = 6000,
+    window_size: int = 250,
+    output_dir: str = "results",
+    device: str = "cpu",
+) -> Dict[str, object]:
+    os.makedirs(output_dir, exist_ok=True)
+    result: Dict[str, object] = {
+        "meta": {
+            "num_drones": 100,
+            "total_tasks": int(total_tasks),
+            "window_size": int(window_size),
+            "seeds": [int(s) for s in seeds],
+        },
+        "methods": {},
+    }
+
+    for method in METHODS:
+        lyap_traces: List[List[float]] = []
+        br_gain_traces: List[List[float]] = []
+        bid_mae_traces: List[List[float]] = []
+        eff_gap_traces: List[List[float]] = []
+
+        for seed in seeds:
+            simulator = SwarmSimulator(
+                num_drones=100,
+                task_arrival_rate=10.0,
+                duration=max(120.0, total_tasks / 10.0 + 5.0),
+                seed=int(seed),
+            )
+
+            daca_cfg = DACAConfig(
+                use_energy_awareness=True,
+                device=device,
+                learning_rate=0.015,
+                critic_lr=0.04,
+                behavior_lr=0.10,
+                anchor_mix=0.60,
+                model_mix=0.95,
+            )
+            pool = AgentPool(100, agent_type=method, daca_config=daca_cfg)
+
+            lyap_trace: List[float] = []
+            br_gain_trace: List[float] = []
+            bid_mae_trace: List[float] = []
+            eff_gap_trace: List[float] = []
+
+            for step in range(total_tasks):
+                task = simulator.next_task()
+                if task is None:
+                    break
+
+                obs: Dict[int, np.ndarray] = {
+                    drone.drone_id: simulator.get_observation(drone, task)
+                    for drone in simulator.drones
+                }
+
+                eps = 0.02 * (0.9996 ** step) if method == "daca" else (0.10 * (0.999 ** step) if method == "qlearning" else 0.0)
+                bids = pool.compute_bids(obs, exploration_noise=eps)
+
+                feasible_ids = [d.drone_id for d in simulator.drones if simulator.compute_feasibility(d, task)]
+                truthful = {i: float(max(0.0, simulator.compute_valuation(simulator.drones[i], task))) for i in feasible_ids}
+
+                result_step = simulator.run_auction(task, bids)
+                winner_id = result_step.get("winner_id", None)
+
+                # Convergence signals: truthful calibration, unilateral deviation gain, and efficiency loss.
+                lyap_trace.append(float(result_step.get("lyapunov_distance", 0.0)))
+                br_gain_trace.append(_best_response_gain(bids, truthful, feasible_ids))
+
+                if feasible_ids:
+                    mae = [abs(float(max(0.0, bids.get(i, 0.0))) - truthful.get(i, 0.0)) for i in feasible_ids]
+                    bid_mae_trace.append(float(np.mean(mae)))
+
+                    best_truth = max(truthful.values()) if truthful else 0.0
+                    winner_truth = truthful.get(winner_id, 0.0) if winner_id is not None else 0.0
+                    eff_gap_trace.append(float(max(0.0, best_truth - winner_truth)))
+                else:
+                    bid_mae_trace.append(0.0)
+                    eff_gap_trace.append(0.0)
+
+                truthful_step = result_step.get("truthful_bids", {})
+                rewards = result_step.get("rewards", {})
+                winner = result_step.get("winner_id", None)
+                if method in ("daca", "qlearning"):
+                    for drone_id, state in obs.items():
+                        reward = float(rewards.get(drone_id, 0.0))
+                        if winner is not None:
+                            if drone_id == winner:
+                                reward += 0.10 * float(task.priority / 100.0)
+                            else:
+                                reward += 0.02 * float(task.priority / 100.0)
+                        pool.update_agent(
+                            drone_id,
+                            state,
+                            float(max(0.0, bids.get(drone_id, 0.0))),
+                            reward,
+                            state,
+                            False,
+                            truthful_bid=float(truthful_step.get(drone_id, 0.0)),
+                            winner_id=winner,
+                        )
+
+            lyap_traces.append(_window_mean(lyap_trace, window_size))
+            br_gain_traces.append(_window_mean(br_gain_trace, window_size))
+            bid_mae_traces.append(_window_mean(bid_mae_trace, window_size))
+            eff_gap_traces.append(_window_mean(eff_gap_trace, window_size))
+
+        agg_lyap = _aggregate_windows(lyap_traces)
+        agg_br = _aggregate_windows(br_gain_traces)
+        agg_mae = _aggregate_windows(bid_mae_traces)
+        agg_eff = _aggregate_windows(eff_gap_traces)
+
+        n_windows = len(agg_lyap["mean"])
+        window_midpoints = [int((i + 0.5) * window_size) for i in range(n_windows)]
+
+        result["methods"][method] = {
+            "window_midpoints": window_midpoints,
+            "lyapunov_mean": agg_lyap["mean"],
+            "lyapunov_std": agg_lyap["std"],
+            "best_response_gain_mean": agg_br["mean"],
+            "best_response_gain_std": agg_br["std"],
+            "bid_mae_mean": agg_mae["mean"],
+            "bid_mae_std": agg_mae["std"],
+            "efficiency_gap_mean": agg_eff["mean"],
+            "efficiency_gap_std": agg_eff["std"],
+        }
+
+    with open(os.path.join(output_dir, "real_convergence.json"), "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    return result
+
+
 def run_scalability_experiment(
     swarm_sizes: Iterable[int] = (20, 50, 100, 200, 500),
     output_dir: str = "results",
@@ -314,6 +507,7 @@ def run_all(output_dir: str = "results", seeds: Iterable[int] = DEFAULT_SEEDS, d
     all_results: Dict[str, object] = {}
     all_results.update(run_method_comparison(DRONE_SWARM_SIZES, seeds, output_dir=output_dir, device=device))
     all_results["convergence"] = run_convergence_experiment(seeds, output_dir=output_dir, device=device)
+    all_results["real_convergence"] = run_real_convergence_experiment(seeds, output_dir=output_dir, device=device)
     all_results["scalability"] = run_scalability_experiment(output_dir=output_dir, device=device)
     all_results["ablation"] = run_ablation_study(seeds, output_dir=output_dir, device=device)
 
@@ -328,7 +522,7 @@ def parse_args() -> argparse.Namespace:
         "--suite",
         type=str,
         default="all",
-        choices=["all", "method", "convergence", "scalability", "ablation"],
+        choices=["all", "method", "convergence", "real_convergence", "scalability", "ablation"],
         help="Experiment suite to run",
     )
     parser.add_argument("--output_dir", type=str, default="results", help="Directory for JSON outputs")
@@ -345,6 +539,8 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help="Device for DACA updates: cpu or cuda",
     )
+    parser.add_argument("--total_tasks", type=int, default=6000, help="Total tasks for real_convergence suite")
+    parser.add_argument("--window_size", type=int, default=250, help="Window size for real_convergence metrics")
     return parser.parse_args()
 
 
@@ -362,6 +558,14 @@ def main() -> None:
         run_method_comparison(DRONE_SWARM_SIZES, args.seeds, output_dir=args.output_dir, device=args.device)
     elif args.suite == "convergence":
         run_convergence_experiment(args.seeds, output_dir=args.output_dir, device=args.device)
+    elif args.suite == "real_convergence":
+        run_real_convergence_experiment(
+            args.seeds,
+            total_tasks=args.total_tasks,
+            window_size=args.window_size,
+            output_dir=args.output_dir,
+            device=args.device,
+        )
     elif args.suite == "scalability":
         run_scalability_experiment(output_dir=args.output_dir, device=args.device)
     elif args.suite == "ablation":

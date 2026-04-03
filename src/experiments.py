@@ -11,8 +11,12 @@ from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 
-from agents import AgentPool, DACAConfig
-from simulator import SwarmSimulator
+try:
+    from src.agents import AgentPool, DACAConfig
+    from src.simulator import SwarmSimulator
+except ImportError:
+    from agents import AgentPool, DACAConfig
+    from simulator import SwarmSimulator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)

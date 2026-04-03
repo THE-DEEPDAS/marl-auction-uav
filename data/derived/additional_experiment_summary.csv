@@ -1,0 +1,5 @@
+statistic,value,notes
+best_effect_size_at_n200_pp,19.4355219017251,DACA - Greedy
+sensitivity_acceptance_min,89.04123711340206,"Across (lambda, buffer) grid"
+sensitivity_acceptance_max,91.6337730318258,"Across (lambda, buffer) grid"
+learning_update_share_at_max_n,0.7382550080690378,n=200

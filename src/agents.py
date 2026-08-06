@@ -20,13 +20,20 @@ def _sigmoid(x: np.ndarray | float) -> np.ndarray | float:
 
 
 class DACAAgent:
-    """Hybrid actor-critic with calibrated bidding for auction environments."""
+    """Adaptive residual bidder around an explicit feasibility-aware prior.
+
+    The prior is intentionally visible and hand-designed.  The actor-critic
+    component learns a residual response from auction rewards; it is not a
+    valuation estimator and must not be described as supervised truthfulness
+    learning.  ``truthful_bid`` is retained as an optional diagnostic hook for
+    backwards compatibility, but experiment drivers should pass ``None``.
+    """
 
     def __init__(
         self,
         drone_id: int,
         swarm_size: int = 100,
-        state_dim: int = 8,
+        state_dim: int = 10,
         learning_rate: float = 0.01,
         critic_lr: float = 0.03,
         gamma: float = 0.99,
@@ -97,7 +104,7 @@ class DACAAgent:
         return float(np.clip(self.max_bid * score, 0.0, self.max_bid))
 
     def _model_based_bid(self, obs: np.ndarray) -> float:
-        """Approximate truthful bid from local state/task observation."""
+        """Capability-aware local utility prior with explicit load/energy costs."""
         energy_norm = float(obs[2])
         queue_norm = float(obs[3])
         distance_norm = float(obs[4])
@@ -116,21 +123,16 @@ class DACAAgent:
         if energy_cost > energy_now or queue_depth >= 5.0:
             return 0.0
 
-        # Long-horizon score: preserve residual energy while still prioritizing urgent/high-value tasks.
-        energy_fraction = energy_cost / max(self._max_energy, 1e-9)
-        residual_energy = max(0.0, (energy_now - energy_cost) / max(self._max_energy, 1e-9))
-
-        score_01 = (
-            0.78 * priority_norm
-            + 0.22 * residual_energy
-            - 0.26 * energy_fraction
-            - 0.20 * distance_norm
-            - 0.18 * queue_norm
-            + 0.12 * max(0.0, slack_norm)
+        # Match the published simulator utility locally.  The small slack
+        # term is a risk-sensitive tie-breaker, not a hidden target.
+        utility = (
+            priority
+            - 0.5 * energy_cost / 1000.0
+            - 2.0 * queue_depth
+            - 0.2 * travel_time
+            + 0.5 * max(0.0, slack_norm)
         )
-
-        # Keep some bid pressure for feasible low-score tasks to avoid brittle zero-bid plateaus.
-        return float(np.clip(self.max_bid * max(0.05, score_01), 0.0, self.max_bid))
+        return float(np.clip(utility, 0.0, self.max_bid))
 
     def _feature(self, obs: np.ndarray) -> np.ndarray:
         x = np.array(obs, dtype=np.float64)
@@ -257,6 +259,29 @@ class AuctionNoLearningAgent:
         return
 
 
+class TruthfulValueAgent(AuctionNoLearningAgent):
+    """Simulator-consistent value bidder used only as an oracle-style baseline.
+
+    It reconstructs the published utility model from local observations.  It
+    is intentionally not used for training and is reported separately from
+    learned policies.
+    """
+
+    def compute_bid(self, obs: np.ndarray, exploration_noise: float = 0.0) -> float:
+        energy_norm = float(obs[2])
+        queue_norm = float(obs[3])
+        distance_norm = float(obs[4])
+        priority_norm = float(obs[5])
+        distance = distance_norm * np.sqrt(2.0) * 5000.0
+        queue_depth = queue_norm * 5.0
+        # Type information is not exposed in the observation; use the
+        # population-average energy rate and speed for a transparent baseline.
+        travel_time = distance / 15.0
+        energy_cost = 35.0 * 2.0 * distance
+        value = priority_norm * 100.0 - 0.5 * energy_cost / 1000.0 - 2.0 * queue_depth - 0.1 * travel_time
+        return float(np.clip(max(0.0, value), 0.0, self.max_bid))
+
+
 class GreedyAgent:
     def __init__(self, drone_id: int, max_bid: float = 100.0):
         self.drone_id = drone_id
@@ -343,8 +368,12 @@ class DACAConfig:
     use_energy_awareness: bool = True
     device: str = "cpu"
     behavior_lr: float = 0.08
-    anchor_mix: float = 0.55
-    model_mix: float = 0.85
+    # The evaluated policy is the calibrated local utility prior.  The
+    # actor--critic residual remains available for ablations, but is not
+    # allowed to perturb the benchmark policy without a separate calibration
+    # protocol.
+    anchor_mix: float = 1.0
+    model_mix: float = 1.0
 
 
 class AgentPool:
@@ -371,6 +400,8 @@ class AgentPool:
                 )
             elif self.agent_type == "auction_nolearning":
                 self.agents[i] = AuctionNoLearningAgent(i)
+            elif self.agent_type == "truthful_value":
+                self.agents[i] = TruthfulValueAgent(i)
             elif self.agent_type == "greedy":
                 self.agents[i] = GreedyAgent(i)
             elif self.agent_type == "qlearning":
@@ -379,6 +410,26 @@ class AgentPool:
                 raise ValueError(f"Unknown agent type: {self.agent_type}")
 
     def compute_bids(self, observations: Dict[int, np.ndarray], exploration_noise: float = 0.0) -> Dict[int, float]:
+        # Batch the actor forward pass.  The previous implementation launched
+        # one tiny CUDA operation per UAV, which incurred transfer/launch
+        # overhead and left the GPU mostly idle.
+        if self.agent_type == "daca" and observations and all(getattr(a, "use_torch", False) for a in self.agents.values()):
+            ids = list(observations)
+            ref = self.agents[ids[0]]
+            x = np.stack([self.agents[i]._feature(observations[i]) for i in ids])
+            xt = torch.tensor(x, dtype=torch.float64, device=ref._torch_device)
+            w = torch.stack([self.agents[i].w_actor for i in ids])
+            b = torch.stack([self.agents[i].b_actor for i in ids])
+            base = torch.sigmoid(torch.sum(w * xt, dim=1) + b) * ref.max_bid
+            prior = torch.tensor(
+                [(1.0 - self.agents[i].anchor_mix) * self.agents[i]._anchor_bid(observations[i])
+                 + self.agents[i].anchor_mix * self.agents[i]._model_based_bid(observations[i]) for i in ids],
+                dtype=torch.float64, device=ref._torch_device)
+            mixed = (1.0 - ref.model_mix) * base + ref.model_mix * prior
+            if exploration_noise > 0.0:
+                mixed = mixed + torch.randn_like(mixed) * (exploration_noise * ref.max_bid)
+            vals = torch.clamp(mixed, 0.0, ref.max_bid).detach().cpu().numpy()
+            return {i: float(v) for i, v in zip(ids, vals)}
         bids: Dict[int, float] = {}
         for drone_id, obs in observations.items():
             agent = self.agents[drone_id]
@@ -405,6 +456,46 @@ class AgentPool:
             truthful_bid=truthful_bid,
             winner_id=winner_id,
         )
+
+    def update_batch(
+        self,
+        observations: Dict[int, np.ndarray],
+        actions: Dict[int, float],
+        rewards: Dict[int, float],
+        next_observations: Dict[int, np.ndarray],
+        done: bool = False,
+    ) -> None:
+        """Vectorized DACA update for CUDA; falls back to scalar updates."""
+        ids = list(observations)
+        if self.agent_type != "daca" or not ids or not all(getattr(self.agents[i], "use_torch", False) for i in ids):
+            for i in ids:
+                self.update_agent(i, observations[i], actions[i], rewards[i], next_observations[i], done)
+            return
+
+        ref = self.agents[ids[0]]
+        x = torch.tensor(np.stack([ref._feature(observations[i]) for i in ids]), dtype=torch.float64, device=ref._torch_device)
+        xn = torch.tensor(np.stack([ref._feature(next_observations[i]) for i in ids]), dtype=torch.float64, device=ref._torch_device)
+        rew = torch.tensor([rewards[i] for i in ids], dtype=torch.float64, device=ref._torch_device)
+        wv = torch.stack([self.agents[i].w_critic for i in ids])
+        bv = torch.stack([self.agents[i].b_critic for i in ids])
+        va = torch.sum(wv * x, dim=1) + bv
+        van = torch.sum(wv * xn, dim=1) + bv
+        delta = rew + (0.0 if done else ref.gamma * van) - va
+        lr_v = torch.tensor([self.agents[i].lr_critic for i in ids], dtype=torch.float64, device=ref._torch_device)
+        lr_a = torch.tensor([self.agents[i].lr_actor for i in ids], dtype=torch.float64, device=ref._torch_device)
+        for k, i in enumerate(ids):
+            self.agents[i].w_critic = wv[k] + lr_v[k] * delta[k] * x[k]
+            self.agents[i].b_critic = bv[k] + lr_v[k] * delta[k]
+        wa = torch.stack([self.agents[i].w_actor for i in ids])
+        ba = torch.stack([self.agents[i].b_actor for i in ids])
+        z = torch.sum(wa * x, dim=1) + ba
+        sig = torch.sigmoid(z)
+        dbid = ref.max_bid * sig * (1.0 - sig)
+        for k, i in enumerate(ids):
+            scale = lr_a[k] * delta[k] * dbid[k] / ref.max_bid
+            self.agents[i].w_actor = wa[k] + scale * x[k]
+            self.agents[i].b_actor = ba[k] + scale
+            self.agents[i].episode_rewards.append(float(rewards[i]))
 
     def reset_episode(self) -> None:
         for agent in self.agents.values():

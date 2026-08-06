@@ -42,6 +42,7 @@ class Drone:
         self.position = self.init_pos.copy()
         self.energy = float(dtype.max_energy)
         self.pending_completion_times: List[float] = []
+        self.pending_destinations: List[np.ndarray] = []
 
         self.total_tasks_assigned = 0
         self.total_tasks_completed = 0
@@ -51,6 +52,7 @@ class Drone:
         self.position = self.init_pos.copy()
         self.energy = float(self.dtype.max_energy)
         self.pending_completion_times = []
+        self.pending_destinations = []
         self.total_tasks_assigned = 0
         self.total_tasks_completed = 0
         self.total_energy_consumed = 0.0
@@ -59,12 +61,16 @@ class Drone:
         if not self.pending_completion_times:
             return
         remaining = []
-        for t_done in self.pending_completion_times:
+        remaining_destinations = []
+        for t_done, destination in zip(self.pending_completion_times, self.pending_destinations):
             if t_done <= now:
                 self.total_tasks_completed += 1
+                self.position = destination.copy()
             else:
                 remaining.append(t_done)
+                remaining_destinations.append(destination)
         self.pending_completion_times = remaining
+        self.pending_destinations = remaining_destinations
 
     @property
     def queue_depth(self) -> int:
@@ -119,6 +125,9 @@ class SwarmSimulator:
         self.missed_tasks = 0
         self.total_welfare = 0.0
         self.total_priority_arrived = 0.0
+        self.total_allocation_efficiency = 0.0
+        self.total_allocation_regret = 0.0
+        self.evaluated_allocations = 0
 
         self.tasks: Dict[int, Task] = {}
         self._task_events: List[Tuple[float, int]] = []
@@ -163,6 +172,9 @@ class SwarmSimulator:
         self.missed_tasks = 0
         self.total_welfare = 0.0
         self.total_priority_arrived = 0.0
+        self.total_allocation_efficiency = 0.0
+        self.total_allocation_regret = 0.0
+        self.evaluated_allocations = 0
         self.tasks = {}
         self._generate_task_events()
 
@@ -251,6 +263,8 @@ class SwarmSimulator:
                 priority_norm,
                 deadline_norm,
                 slack_norm,
+                min(drone.dtype.cruise_speed / 20.0, 1.0),
+                min(drone.dtype.energy_rate / 50.0, 1.0),
             ],
             dtype=np.float64,
         )
@@ -265,6 +279,16 @@ class SwarmSimulator:
             b = float(max(0.0, bids.get(drone.drone_id, 0.0)))
             if self.compute_feasibility(drone, task):
                 feasible_bids.append((b, drone.drone_id))
+
+        # Ex-post benchmark: the feasible UAV with the largest simulator
+        # utility. This is never exposed to the learner and is used only to
+        # measure allocation regret and efficiency loss.
+        oracle_id = None
+        oracle_value = 0.0
+        if truthful_vals:
+            candidates = [(v, i) for i, v in truthful_vals.items() if self.compute_feasibility(self.drones[i], task)]
+            if candidates:
+                oracle_value, oracle_id = max(candidates, key=lambda x: (x[0], -x[1]))
 
         rewards = {d.drone_id: 0.0 for d in self.drones}
         winner_id: Optional[int] = None
@@ -292,10 +316,9 @@ class SwarmSimulator:
 
             winner.energy = max(0.0, winner.energy - energy_cost)
             winner.total_energy_consumed += energy_cost
-            winner.position = task.location.copy()
-
             finish_time = self.current_time + travel_time + task.processing_time
             winner.pending_completion_times.append(finish_time)
+            winner.pending_destinations.append(task.location.copy())
             winner.total_tasks_assigned += 1
 
             task.completed = True
@@ -305,6 +328,13 @@ class SwarmSimulator:
         else:
             self.missed_tasks += 1
 
+        allocation_efficiency = float((max(0.0, winner_val) / max(oracle_value, 1e-12)) if winner_id is not None and oracle_id is not None else 0.0)
+        allocation_regret = float(max(0.0, oracle_value - (winner_val if winner_id is not None else 0.0)))
+        if oracle_id is not None:
+            self.total_allocation_efficiency += allocation_efficiency
+            self.total_allocation_regret += allocation_regret
+            self.evaluated_allocations += 1
+
         return {
             "task_id": task.task_id,
             "time": self.current_time,
@@ -313,6 +343,10 @@ class SwarmSimulator:
             "payment": payment,
             "rewards": rewards,
             "truthful_bids": truthful_vals,
+            "oracle_winner_id": oracle_id,
+            "oracle_value": float(max(0.0, oracle_value)),
+            "allocation_efficiency": allocation_efficiency,
+            "allocation_regret": allocation_regret,
             "lyapunov_distance": float(lyapunov),
             "completed_tasks": self.completed_tasks,
             "missed_tasks": self.missed_tasks,
@@ -346,6 +380,8 @@ class SwarmSimulator:
             "avg_energy_consumption": self.get_avg_energy_consumption(),
             "normalized_welfare": self.get_normalized_welfare(),
             "fairness_index": self.get_fairness_index(),
+            "allocation_efficiency": float(self.total_allocation_efficiency / max(self.evaluated_allocations, 1)),
+            "allocation_regret": float(self.total_allocation_regret / max(self.evaluated_allocations, 1)),
             "completed_tasks": float(self.completed_tasks),
             "missed_tasks": float(self.missed_tasks),
             "arrived_tasks": float(self.total_tasks_arrived),

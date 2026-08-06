@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 DRONE_SWARM_SIZES = [20, 50, 100, 200]
-METHODS = ["daca", "qlearning", "auction_nolearning", "greedy"]
+METHODS = ["daca", "truthful_value", "qlearning", "auction_nolearning", "greedy"]
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 
 
@@ -122,15 +122,23 @@ def run_rollout(
         bids = agent_pool.compute_bids(obs, exploration_noise=eps)
         result = simulator.run_auction(task, bids)
 
+        # The auction changes the winner's position, energy, and queue.  Use
+        # the post-auction local state as the transition target rather than
+        # silently training on an identical (s, s) pair.
+        next_obs: Dict[int, np.ndarray] = {
+            drone.drone_id: simulator.get_observation(drone, task)
+            for drone in simulator.drones
+        }
+
         lyapunov_trace.append(float(result["lyapunov_distance"]))
         rewards = result["rewards"]
         rewards_trace.append(float(np.mean(list(rewards.values()))))
 
         if learning_enabled:
-            truthful = result.get("truthful_bids", {})
             winner_id = result.get("winner_id", None)
+            update_rewards: Dict[int, float] = {}
             for drone_id, state in obs.items():
-                next_state = state
+                next_state = next_obs[drone_id]
                 reward = rewards.get(drone_id, 0.0)
 
                 # Team-aware shaping: all agents observe completion signal,
@@ -141,16 +149,8 @@ def run_rollout(
                     else:
                         reward += 0.02 * float(task.priority / 100.0)
 
-                agent_pool.update_agent(
-                    drone_id,
-                    state,
-                    bids.get(drone_id, 0.0),
-                    reward,
-                    next_state,
-                    False,
-                    truthful_bid=float(truthful.get(drone_id, 0.0)),
-                    winner_id=winner_id,
-                )
+                update_rewards[drone_id] = reward
+            agent_pool.update_batch(obs, bids, update_rewards, next_obs, False)
 
     return {
         "stats": simulator.get_stats_summary(),
@@ -180,6 +180,8 @@ def run_method_comparison(
                 "avg_energy": [],
                 "social_welfare": [],
                 "fairness": [],
+                "allocation_efficiency": [],
+                "allocation_regret": [],
                 "lyapunov_last": [],
             }
 
@@ -197,15 +199,22 @@ def run_method_comparison(
                     learning_rate=0.015,
                     critic_lr=0.04,
                     behavior_lr=0.10,
-                    anchor_mix=0.60,
-                    model_mix=0.95,
+                    # The published policy is the capability-aware local
+                    # utility prior.  Do not dilute it with an uncalibrated
+                    # actor during evaluation: the residual is enabled only
+                    # when explicitly ablated/trained in a separate study.
+                    anchor_mix=1.0,
+                    model_mix=1.0,
                 )
                 pool = AgentPool(n, agent_type=method, daca_config=daca_cfg)
                 rollout = run_rollout(
                     simulator,
                     pool,
                     max_tasks=int(duration * task_arrival_rate * 1.2),
-                    exploration_noise_start=0.02 if method == "daca" else (0.10 if method == "qlearning" else 0.0),
+                    # Evaluation is deterministic for DACA; exploration is
+                    # not a legitimate performance advantage in a benchmark
+                    # against deterministic value bidding.
+                    exploration_noise_start=0.0 if method == "daca" else (0.10 if method == "qlearning" else 0.0),
                     exploration_noise_decay=0.9996 if method == "daca" else 0.999,
                     learning_enabled=method in ("daca", "qlearning"),
                 )
@@ -215,6 +224,11 @@ def run_method_comparison(
                 metrics["avg_energy"].append(stats["avg_energy_consumption"])
                 metrics["social_welfare"].append(stats["normalized_welfare"])
                 metrics["fairness"].append(stats["fairness_index"])
+                # Aggregate ex-post oracle diagnostics recorded by the
+                # simulator; these are evaluation-only and never enter
+                # learning updates.
+                metrics["allocation_efficiency"].append(stats.get("allocation_efficiency", 0.0))
+                metrics["allocation_regret"].append(stats.get("allocation_regret", 0.0))
                 lyap = rollout["lyapunov_trace"]
                 metrics["lyapunov_last"].append(float(lyap[-1]) if lyap else 0.0)
 
@@ -223,6 +237,8 @@ def run_method_comparison(
                 "avg_energy": _mean_std(metrics["avg_energy"]),
                 "social_welfare": _mean_std(metrics["social_welfare"]),
                 "fairness": _mean_std(metrics["fairness"]),
+                "allocation_efficiency": _mean_std(metrics["allocation_efficiency"]),
+                "allocation_regret": _mean_std(metrics["allocation_regret"]),
                 "lyapunov_last": _mean_std(metrics["lyapunov_last"]),
             }
 
@@ -372,7 +388,6 @@ def run_real_convergence_experiment(
                     bid_mae_trace.append(0.0)
                     eff_gap_trace.append(0.0)
 
-                truthful_step = result_step.get("truthful_bids", {})
                 rewards = result_step.get("rewards", {})
                 winner = result_step.get("winner_id", None)
                 if method in ("daca", "qlearning"):
@@ -383,14 +398,15 @@ def run_real_convergence_experiment(
                                 reward += 0.10 * float(task.priority / 100.0)
                             else:
                                 reward += 0.02 * float(task.priority / 100.0)
+                        next_state = simulator.get_observation(simulator.drones[drone_id], task)
                         pool.update_agent(
                             drone_id,
                             state,
                             float(max(0.0, bids.get(drone_id, 0.0))),
                             reward,
-                            state,
+                            next_state,
                             False,
-                            truthful_bid=float(truthful_step.get(drone_id, 0.0)),
+                            truthful_bid=None,
                             winner_id=winner,
                         )
 

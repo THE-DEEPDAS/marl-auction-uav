@@ -563,6 +563,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window_size", type=int, default=250, help="Window size for real_convergence metrics")
     parser.add_argument("--swarm_sizes", type=int, nargs="*", default=DRONE_SWARM_SIZES,
                         help="Fleet sizes for the method suite")
+    parser.add_argument("--duration", type=float, default=600.0,
+                        help="Mission duration in seconds for the method suite")
+    parser.add_argument("--task_arrival_rate", type=float, default=1.0,
+                        help="Poisson task-arrival rate for the method suite")
     return parser.parse_args()
 
 
@@ -577,7 +581,9 @@ def main() -> None:
     if args.suite == "all":
         run_all(args.output_dir, args.seeds, device=args.device)
     elif args.suite == "method":
-        run_method_comparison(args.swarm_sizes, args.seeds, output_dir=args.output_dir, device=args.device)
+        run_method_comparison(args.swarm_sizes, args.seeds, duration=args.duration,
+                              task_arrival_rate=args.task_arrival_rate,
+                              output_dir=args.output_dir, device=args.device)
     elif args.suite == "convergence":
         run_convergence_experiment(args.seeds, output_dir=args.output_dir, device=args.device)
     elif args.suite == "real_convergence":

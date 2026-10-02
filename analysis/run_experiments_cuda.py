@@ -645,6 +645,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--require-cuda", action="store_true", help="Fail if CUDA is unavailable.")
     p.add_argument("--seeds", default="0,1,2,3,4", type=str)
     p.add_argument("--swarm-sizes", default="20,50,100,200,500", type=str)
+    p.add_argument("--skip-sensitivity", action="store_true", help="Run only the seed-by-size evaluation suite.")
     return p.parse_args()
 
 
@@ -678,17 +679,18 @@ def main() -> None:
     )
     seed_df.to_csv(out_dir / "seed_metrics.csv", index=False)
 
-    sens_df = run_sensitivity_suite(
-        method="DACA",
-        n_agents=200,
-        seeds=seeds,
-        arrival_rates=[0.5, 1.0, 1.5, 2.0],
-        deadline_buffers=[60, 120, 180, 240, 300],
-        tasks_per_cell=args.tasks_per_sensitivity_cell,
-        cfg=cfg,
-        device=device,
-    )
-    sens_df.to_csv(out_dir / "scenario_sensitivity.csv", index=False)
+    if not args.skip_sensitivity:
+        sens_df = run_sensitivity_suite(
+            method="DACA",
+            n_agents=200,
+            seeds=seeds,
+            arrival_rates=[0.5, 1.0, 1.5, 2.0],
+            deadline_buffers=[60, 120, 180, 240, 300],
+            tasks_per_cell=args.tasks_per_sensitivity_cell,
+            cfg=cfg,
+            device=device,
+        )
+        sens_df.to_csv(out_dir / "scenario_sensitivity.csv", index=False)
 
     runtime_df = build_runtime_breakdown(seed_df)
     runtime_df.to_csv(out_dir / "runtime_breakdown.csv", index=False)
